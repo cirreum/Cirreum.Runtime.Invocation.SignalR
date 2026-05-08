@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-05-08
+
 ### Added
 
 Initial release of the Cirreum SignalR Runtime Extensions package — the L5 piece that surfaces app-facing extension methods for wiring SignalR Hubs into Cirreum's unified `IInvocationContext` seam. Mirrors the Identity track's `Cirreum.Runtime.Identity.Oidc` shape. Anchored by ADR-0002 (Unified `IInvocationContext` Seam).
