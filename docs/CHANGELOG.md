@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Bumped `Cirreum.Invocation.SignalR` dependency to flow through the L2 `IConnectionSender` → `IInvocationConnection.SendAsync` consolidation (see the upcoming `Cirreum.InvocationProvider` and `Cirreum.Invocation.SignalR` release notes). No changes to the L5 surface — `AddSignalRInvocation` / `AddSignalR<THub>` / `MapSignalRInvocation` are unchanged. App-side migration (only relevant if your app injected `IConnectionSender` directly): switch to `accessor.Current?.Connection?.SendAsync(...)`.
+
 ## [1.0.0] - 2026-05-08
 
 ### Added

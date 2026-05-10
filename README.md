@@ -16,7 +16,7 @@
 - `AddSignalR<THub>(instanceKey)` on `IInvocationBuilder` — captures `THub` at the call site, stashes the `(instanceKey, typeof(THub))` pair as a `SignalRHubMapping` in DI for the L3 registrar to resolve.
 - `MapSignalRInvocation()` on `IEndpointRouteBuilder` — invokes every `InvocationProviderMapping` whose `ProviderName` matches `SignalRInvocationRegistrar.ProviderKey`, walking enabled instances and mapping each Hub at its configured path.
 
-Apps install this package directly. It transitively pulls the L3 `Cirreum.Invocation.SignalR` (registrar, settings, HubFilter, connection adapter, `IConnectionSender` impl) and the L4 `Cirreum.Runtime.InvocationProvider` (helper, scope object).
+Apps install this package directly. It transitively pulls the L3 `Cirreum.Invocation.SignalR` (registrar, settings, HubFilter, connection adapter that implements `IInvocationConnection.SendAsync<T>`) and the L4 `Cirreum.Runtime.InvocationProvider` (helper, scope object).
 
 ## Architectural position
 
@@ -52,7 +52,7 @@ The `AddSignalRInvocation()` extension does two things:
 
 1. Marker-dedup'd: registers the SignalR invocation source by calling `builder.RegisterInvocationProvider<SignalRInvocationRegistrar, SignalRInvocationSettings, SignalRInvocationInstanceSettings>()` from the L4 helper. The L4 helper:
    - Binds `Cirreum:Invocation:Providers:SignalR` from `IConfiguration` to `SignalRInvocationSettings`.
-   - Calls `registrar.Register(...)` — services phase — which calls `services.AddSignalR()`, registers the `InvocationContextHubFilter` against the global `HubOptions`, and registers `SignalRConnectionSender` as the scoped `IConnectionSender` impl.
+   - Calls `registrar.Register(...)` — services phase — which calls `services.AddSignalR()` and registers the `InvocationContextHubFilter` against the global `HubOptions`.
    - Stashes an `InvocationProviderMapping` in DI capturing the deferred `registrar.Map(...)` closure.
 2. Opens the `IInvocationBuilder` scope for the configure callback so apps can chain `AddSignalR<THub>(instanceKey)` calls per Hub-type.
 
@@ -156,69 +156,61 @@ Each subclass gets its own `HubOptions<T>` and its own DI registration; the inhe
 
 ## Server-initiated push
 
-Inject `IConnectionSender` from a SignalR Hub method (or any code running inside the SignalR invocation pipeline — including Conductor command/query handlers triggered from a Hub method) to push to the calling client:
+From a SignalR Hub method (or any code running inside the SignalR invocation pipeline — including Conductor command/query handlers triggered from a Hub method), push to the calling client through the ambient `IInvocationContextAccessor.Current.Connection`:
 
 ```csharp
-public sealed class ChatHub(IConnectionSender sender) : Hub {
+public sealed class ChatHub(IInvocationContextAccessor accessor) : Hub {
     public async Task Echo(string text) {
-        await sender.SendAsync("Echo", new { text, at = DateTime.UtcNow });
+        var connection = accessor.Current?.Connection;
+        if (connection is not null) {
+            await connection.SendAsync("Echo", new { text, at = DateTime.UtcNow });
+        }
     }
 }
 
 // AsyncLocal flows the invocation through Conductor — the same handler
-// code can run from HTTP or SignalR; IConnectionSender lights up only
-// when there's a long-lived calling connection.
+// code can run from HTTP or SignalR; the connection is non-null only when
+// there's a long-lived calling connection.
 public sealed class GenerateReportHandler(
-    IConnectionSender sender) : ICommandHandler<GenerateReportCommand> {
+    IInvocationContextAccessor accessor) : ICommandHandler<GenerateReportCommand> {
 
     public async ValueTask<Result> Handle(GenerateReportCommand cmd, CancellationToken ct) {
-        await sender.SendAsync("Progress", new { Percent = 0,   Stage = "Loading"   }, ct);
+        var connection = accessor.Current?.Connection;
+        if (connection is not null) {
+            await connection.SendAsync("Progress", new { Percent = 0,   Stage = "Loading" }, ct);
+        }
         // ... work ...
-        await sender.SendAsync("Progress", new { Percent = 100, Stage = "Done"      }, ct);
+        if (connection is not null) {
+            await connection.SendAsync("Progress", new { Percent = 100, Stage = "Done" }, ct);
+        }
         return Result.Success(/* ... */);
     }
 
 }
 ```
 
-The no-method `SendAsync<T>(payload)` overload uses the runtime type name as the SignalR method-routing convention (e.g. `SendAsync(new ChatMessage(...))` dispatches to client `connection.on("ChatMessage", ...)`); the keyed `SendAsync<T>(method, payload)` overload accepts an explicit method name.
+The no-method `SendAsync<T>(payload)` overload uses the runtime type name as the SignalR method-routing convention (e.g. `SendAsync(new ChatMessage(...))` dispatches to client `connection.on("ChatMessage", ...)`); the keyed `SendAsync<T>(method, payload)` overload accepts an explicit method name. Serialization flows through SignalR's configured `IHubProtocol` (JSON or MessagePack — set via `AddSignalR().AddJsonProtocol(...)` / `.AddMessagePackProtocol()`).
 
-### What `IConnectionSender` does and doesn't do
+Hub method bodies that already use the SignalR-native `Clients.Caller.SendAsync(...)` API are equivalent — both paths target the same SignalR pipeline.
 
-`IConnectionSender` is **bound to the active invocation** — it pushes to the connection that delivered the *currently-executing* Hub method (or downstream Conductor handler invoked from one). It is **not** a general server-to-client push mechanism for arbitrary connections.
+### What `Connection.SendAsync` does and doesn't do
+
+The connection's typed `SendAsync<T>` is **bound to the active invocation** — it pushes to the connection that delivered the *currently-executing* Hub method (or downstream Conductor handler invoked from one). It is **not** a general server-to-client push mechanism for arbitrary connections.
 
 | You want to | Use |
 |---|---|
-| Push extra messages to the client that triggered this Hub method (progress, streaming partial results, multi-message responses) | **`IConnectionSender`** (Cirreum-abstracted) |
+| Push extra messages to the client that triggered this Hub method (progress, streaming partial results, multi-message responses) | **`accessor.Current?.Connection?.SendAsync(...)`** (Cirreum-abstracted) |
 | Push to a *different* connected client by `ConnectionId` | `IHubContext<THub>.Clients.Client(id).SendAsync(...)` (SignalR-native) |
 | Broadcast to all connected clients | `IHubContext<THub>.Clients.All.SendAsync(...)` (SignalR-native) |
 | Push to a SignalR group | `IHubContext<THub>.Clients.Group(name).SendAsync(...)` (SignalR-native) |
-| Push from a background service, timer, or inbound webhook (no active invocation) | `IHubContext<THub>.Clients.X.SendAsync(...)` (SignalR-native) — `IConnectionSender` would throw because there's no active connection |
-| Push from a handler invoked via HTTP | n/a — HTTP is request/response. `IConnectionSender` would throw because `IInvocationContext.Connection` is `null` for HTTP. Use the handler's return value instead. |
+| Push from a background service, timer, or inbound webhook (no active invocation) | `IHubContext<THub>.Clients.X.SendAsync(...)` (SignalR-native) — the ambient connection is null when no active invocation exists |
+| Push from a handler invoked via HTTP | n/a — HTTP is request/response. `IInvocationContext.Connection` is `null` for HTTP. Use the handler's return value instead. |
 
 `IHubContext<THub>` is registered as a singleton by `services.AddSignalR()` — inject it anywhere, including code with no active invocation context. Cirreum doesn't abstract this surface because "push to arbitrary connection by id / group / all" varies wildly across long-lived transports (SignalR's rich `Clients` API, raw WebSocket's hand-rolled registries, gRPC streaming's one-stream-at-a-time model). The seam unifies *identity, pipeline, and the calling-client reply path*; transport-specific superpowers stay accessible through their native APIs.
 
 ### Handlers that may run from both HTTP and SignalR
 
-If you want a Conductor handler to push progress when invoked via SignalR but also work normally when invoked via HTTP, feature-check before pushing:
-
-```csharp
-public sealed class GenerateReportHandler(
-    IInvocationContextAccessor accessor,
-    IConnectionSender sender) : ICommandHandler<GenerateReportCommand> {
-
-    public async ValueTask<Result> Handle(GenerateReportCommand cmd, CancellationToken ct) {
-        var canPush = accessor.Current?.Connection is not null;
-
-        if (canPush) await sender.SendAsync("Progress", new { Percent = 0 }, ct);
-        // ... work ...
-        if (canPush) await sender.SendAsync("Progress", new { Percent = 100 }, ct);
-
-        return Result.Success(/* ... */);
-    }
-
-}
-```
+The null-check on `accessor.Current?.Connection` is the natural feature gate: when invoked from HTTP it's `null` and the push is skipped; when invoked from SignalR it's non-null and the push happens. Same handler, both transports, no special branching beyond the null check shown in the example above.
 
 The HTTP caller gets the return value; the SignalR caller gets the progress stream *and* the return value.
 
@@ -280,14 +272,14 @@ app.MapSignalRInvocation();
 await app.RunAsync();
 ```
 
-Everything else — `InvocationContextHubFilter` publishing `IInvocationContext` per Hub method invocation, `SignalRConnection` materialization, `IConnectionSender` for in-invocation push, `IConnectionLifecycle` for connect/disconnect callbacks, `IHubContext<THub>` for out-of-band push — keeps working identically. The Cirreum framework code doesn't know or care whether SignalR is self-hosted or routed through Azure SignalR Service.
+Everything else — `InvocationContextHubFilter` publishing `IInvocationContext` per Hub method invocation, `SignalRConnection` materialization, `IInvocationConnection.SendAsync` for in-invocation push, `IConnectionLifecycle` for connect/disconnect callbacks, `IHubContext<THub>` for out-of-band push — keeps working identically. The Cirreum framework code doesn't know or care whether SignalR is self-hosted or routed through Azure SignalR Service.
 
 There is intentionally **no separate `Cirreum.Invocation.SignalR.Azure` package**. Azure SignalR Service is a deployment topology, not a different SignalR implementation — the same Cirreum SignalR L3+L5 packages serve both. We add per-implementation Cirreum packages only when there's framework-specific integration code to write (the Authorization track has separate `Oidc` / `Entra` / `External` packages because OIDC and Entra have genuinely different claim shapes, trust roots, and validation paths to abstract). For Azure SignalR Service vs. self-hosted SignalR, Microsoft's own API already abstracts the difference.
 
 ## Dependencies
 
 - **Cirreum.Runtime.InvocationProvider** `1.1.0+` — L4 helper (`IInvocationBuilder` scope object, `RegisterInvocationProvider<>` helper, `InvocationProviderMapping` record)
-- **Cirreum.Invocation.SignalR** `1.0.1+` — L3 registrar, settings, `HubFilter`, connection adapter, `SignalRInvocationRegistrar.ProviderKey` const
+- **Cirreum.Invocation.SignalR** `1.2.0+` — L3 registrar, settings, `HubFilter`, connection adapter (with typed `SendAsync<T>` overloads), `SignalRInvocationRegistrar.ProviderKey` const
 - **Microsoft.AspNetCore.App** (framework reference) — SignalR (`Microsoft.AspNetCore.SignalR`), endpoint routing
 
 ## Versioning

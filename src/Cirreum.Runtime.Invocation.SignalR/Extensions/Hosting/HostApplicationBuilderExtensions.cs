@@ -2,7 +2,6 @@ namespace Microsoft.Extensions.Hosting;
 
 using Cirreum.Invocation;
 using Cirreum.Invocation.Configuration;
-using Cirreum.Providers;
 using Microsoft.AspNetCore.SignalR;
 using Microsoft.Extensions.DependencyInjection;
 
@@ -17,7 +16,8 @@ public static class HostApplicationBuilderExtensions {
 	/// Registers the Cirreum SignalR invocation source — surfaces SignalR Hubs as Cirreum
 	/// invocation sources, with full per-method <see cref="IInvocationContext"/> publication,
 	/// per-connection <c>IInvocationConnection</c> materialization, <c>IConnectionLifecycle</c>
-	/// callback dispatch, and <c>IConnectionSender</c> server-push. Binds instances from
+	/// callback dispatch, and typed-payload server-push through
+	/// <c>IInvocationConnection.SendAsync</c>. Binds instances from
 	/// <c>Cirreum:Invocation:Providers:SignalR:Instances:*</c>.
 	/// </summary>
 	/// <param name="builder">The host application builder.</param>
